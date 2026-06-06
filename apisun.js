@@ -2,6 +2,19 @@ const WebSocket = require('ws');
 const express = require('express');
 const cors = require('cors');
 const os = require('os');
+const fs = require('fs');
+
+// ========== FIX 1: LƯU SESSION VÀO DISK ==========
+const SESSION_FILE = './session_cache.json';
+let lastSessionId = null;
+
+try {
+    if (fs.existsSync(SESSION_FILE)) {
+        const saved = JSON.parse(fs.readFileSync(SESSION_FILE));
+        lastSessionId = saved.lastSessionId;
+        console.log(`[💾] Khôi phục session từ disk: ${lastSessionId}`);
+    }
+} catch(e) {}
 
 // Patch network cho iSH
 const originalNetworkInterfaces = os.networkInterfaces;
@@ -28,21 +41,34 @@ let apiResponseData = {
     "Tong": null,
     "Ket_qua": "",
     "id": "@mrtinhios",
-    "server_time": new Date().toISOString()
+    "server_time": new Date().toISOString(),
+    "update_count": 0
 };
 
 let currentSessionId = null;
-let lastSessionId = null;  // LƯU SESSION
-let lastKnownData = null;   // LƯU KẾT QUẢ CUỐI
+let lastKnownData = null;
 const patternHistory = [];
 
 const WEBSOCKET_URL = "wss://websocket.azhkthg1.net/websocket?token=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJhbW91bnQiOjAsInVzZXJuYW1lIjoiU0NfYXBpc3Vud2luMTIzIn0.hgrRbSV6vnBwJMg9ZFtbx3rRu9mX_hZMZ_m5gMNhkw0";
 const WS_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Origin": "https://play.sun.win"
+    "Origin": "https://play.sun.win",
+    "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.8",
+    "Cache-Control": "no-cache"
 };
-const RECONNECT_DELAY = 1000;  // GIẢM XUỐNG 1 GIÂY
-const PING_INTERVAL = 10000;    // GIẢM XUỐNG 10 GIÂY
+
+// ========== FIX 2: GIẢM PING XUỐNG 8 GIÂY, TĂNG TIMEOUT ==========
+const PING_INTERVAL = 8000;
+const HEARTBEAT_TIMEOUT = 25000;
+const MAX_RECONNECT_ATTEMPTS = 20;
+
+let ws = null;
+let pingInterval = null;
+let reconnectTimeout = null;
+let isReconnecting = false;
+let reconnectAttempts = 0;
+let lastMessageTime = Date.now();
+let forceReconnectTimer = null;
 
 const initialMessages = [
     [
@@ -59,61 +85,87 @@ const initialMessages = [
     [6, "MiniGame", "lobbyPlugin", { cmd: 10001 }]
 ];
 
-let ws = null;
-let pingInterval = null;
-let reconnectTimeout = null;
-let isReconnecting = false;
-
-const getNetworkInfo = () => {
-    let localIP = '127.0.0.1';
-    try {
-        const interfaces = os.networkInterfaces();
-        for (const ifaceName in interfaces) {
-            for (const iface of interfaces[ifaceName]) {
-                if (!iface.internal && iface.family === 'IPv4') {
-                    localIP = iface.address;
-                    break;
-                }
-            }
+// ========== FIX 3: KIỂM TRA TIMEOUT ==========
+function startHeartbeatMonitor() {
+    if (forceReconnectTimer) clearInterval(forceReconnectTimer);
+    forceReconnectTimer = setInterval(() => {
+        const now = Date.now();
+        if (ws && ws.readyState === WebSocket.OPEN && (now - lastMessageTime) > HEARTBEAT_TIMEOUT) {
+            console.log('[⚠️] 25s không có dữ liệu -> force reconnect');
+            try { ws.terminate(); } catch(e) {}
         }
-    } catch(e) {}
-    return { localIP, publicIP: null };
-};
+    }, 10000);
+}
 
-function sendReconnectSession() {
-    if (ws && ws.readyState === WebSocket.OPEN && lastSessionId) {
-        console.log(`[🔄] Đang gửi lại session ${lastSessionId}`);
-        ws.send(JSON.stringify([6, "MiniGame", "taixiuPlugin", { cmd: 1005, sid: lastSessionId }]));
+// ========== FIX 4: LƯU SESSION XUỐNG DISK ==========
+function saveSessionToDisk(sessionId) {
+    if (sessionId) {
+        fs.writeFileSync(SESSION_FILE, JSON.stringify({ lastSessionId: sessionId, savedAt: Date.now() }));
     }
 }
 
+// ========== FIX 5: EXPONENTIAL BACKOFF ==========
+function getReconnectDelay() {
+    const delay = Math.min(1000 * Math.pow(1.5, reconnectAttempts), 30000);
+    return Math.floor(delay);
+}
+
 function connectWebSocket() {
-    if (isReconnecting) return;
+    if (isReconnecting && reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+        console.log('[⚠️] Đã đạt giới hạn reconnect, thử lại sau 60s');
+        setTimeout(() => {
+            reconnectAttempts = 0;
+            connectWebSocket();
+        }, 60000);
+        return;
+    }
+    
+    if (reconnectAttempts > 0) {
+        const delay = getReconnectDelay();
+        console.log(`[⏳] Thử reconnect lần ${reconnectAttempts}, chờ ${delay}ms`);
+        clearTimeout(reconnectTimeout);
+        reconnectTimeout = setTimeout(() => {
+            isReconnecting = false;
+            connectWebSocket();
+        }, delay);
+        return;
+    }
+    
     isReconnecting = true;
+    reconnectAttempts++;
     
     if (ws) {
         ws.removeAllListeners();
-        ws.close();
+        try { ws.terminate(); } catch(e) {}
     }
 
-    ws = new WebSocket(WEBSOCKET_URL, { headers: WS_HEADERS });
+    // ========== FIX 6: THÊM OPTIONS CHỐNG NGẮT KẾT NỐI ==========
+    ws = new WebSocket(WEBSOCKET_URL, { 
+        headers: WS_HEADERS,
+        perMessageDeflate: false,
+        handshakeTimeout: 10000
+    });
 
     ws.on('open', () => {
-        console.log('[✅] WebSocket connected to Sun.Win');
+        console.log('[✅] WebSocket connected');
         isReconnecting = false;
+        reconnectAttempts = 0;
+        lastMessageTime = Date.now();
+        startHeartbeatMonitor();
         
         // Gửi tin nhắn khởi tạo
         initialMessages.forEach((msg, i) => {
             setTimeout(() => {
-                if (ws.readyState === WebSocket.OPEN) {
+                if (ws && ws.readyState === WebSocket.OPEN) {
                     ws.send(JSON.stringify(msg));
+                    console.log(`[📤] Gửi init message ${i+1}`);
                 }
-            }, i * 600);
+            }, i * 400);
         });
         
-        // Nếu có session cũ, gửi lại sau 2 giây
+        // Khôi phục session cũ
         setTimeout(() => {
-            if (lastSessionId && ws.readyState === WebSocket.OPEN) {
+            if (lastSessionId && ws && ws.readyState === WebSocket.OPEN) {
                 console.log(`[🔄] Khôi phục session ${lastSessionId}`);
                 ws.send(JSON.stringify([6, "MiniGame", "taixiuPlugin", { cmd: 1005, sid: lastSessionId }]));
             }
@@ -121,19 +173,19 @@ function connectWebSocket() {
 
         clearInterval(pingInterval);
         pingInterval = setInterval(() => {
-            if (ws.readyState === WebSocket.OPEN) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
                 ws.ping();
-                // Gửi heartbeat message
                 ws.send(JSON.stringify([6, "MiniGame", "heartbeat", { cmd: 9999, ts: Date.now() }]));
             }
         }, PING_INTERVAL);
     });
 
     ws.on('pong', () => {
-        console.log('[📶] Ping OK');
+        lastMessageTime = Date.now();
     });
 
     ws.on('message', (message) => {
+        lastMessageTime = Date.now();
         try {
             const data = JSON.parse(message);
             if (!Array.isArray(data) || typeof data[1] !== 'object') return;
@@ -142,12 +194,16 @@ function connectWebSocket() {
 
             if (cmd === 1008 && sid) {
                 currentSessionId = sid;
-                lastSessionId = sid;  // LƯU SESSION
+                if (lastSessionId !== sid) {
+                    lastSessionId = sid;
+                    saveSessionToDisk(sid);
+                }
                 console.log(`[🎮] Session: ${sid}`);
             }
 
-            if (cmd === 1003 && gBB) {
-                if (!d1 || !d2 || !d3) return;
+            if (cmd === 1003 && gBB === true) {
+                if (typeof d1 !== 'number' || typeof d2 !== 'number' || typeof d3 !== 'number') return;
+                if (d1 < 1 || d1 > 6 || d2 < 1 || d2 > 6 || d3 < 1 || d3 > 6) return;
                 
                 const total = d1 + d2 + d3;
                 const result = (total > 10) ? "Tài" : "Xỉu";
@@ -179,22 +235,41 @@ function connectWebSocket() {
                 if (patternHistory.length > 100) patternHistory.pop();
             }
         } catch (e) {
-            console.error('[❌] Lỗi xử lý message:', e.message);
+            console.error('[❌] Lỗi parse message:', e.message);
         }
     });
 
     ws.on('close', (code, reason) => {
-        console.log(`[🔌] Closed: ${code}`);
+        console.log(`[🔌] Đóng kết nối, code: ${code}`);
         clearInterval(pingInterval);
-        clearTimeout(reconnectTimeout);
-        reconnectTimeout = setTimeout(connectWebSocket, RECONNECT_DELAY);
+        clearInterval(forceReconnectTimer);
+        if (code !== 1000) {
+            reconnectAttempts++;
+            setTimeout(() => {
+                isReconnecting = false;
+                connectWebSocket();
+            }, getReconnectDelay());
+        } else {
+            setTimeout(() => {
+                isReconnecting = false;
+                connectWebSocket();
+            }, 3000);
+        }
     });
 
     ws.on('error', (err) => {
-        console.error(`[❌] Error: ${err.message}`);
-        ws.close();
+        console.error(`[❌] Lỗi WebSocket: ${err.message}`);
+        if (ws) ws.close();
     });
 }
+
+// ========== FIX 7: XỬ LÝ SIGTERM ==========
+process.on('SIGTERM', () => {
+    console.log('[🛑] Nhận SIGTERM, lưu session...');
+    if (lastSessionId) saveSessionToDisk(lastSessionId);
+    if (ws) ws.close();
+    setTimeout(() => process.exit(0), 1000);
+});
 
 // API Routes
 app.get('/api/ditmemaysun', (req, res) => res.json(apiResponseData));

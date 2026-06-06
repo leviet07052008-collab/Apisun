@@ -1,0 +1,6 @@
+cd ~/apisunwin
+cat > .gitignore << 'EOF'
+node_modules/
+.env
+*.log
+EOF

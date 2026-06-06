@@ -1,289 +1,451 @@
-const WebSocket = require('ws');
-const express = require('express');
-const cors = require('cors');
-const os = require('os');
-const fs = require('fs');
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>SunWin Dự Đoán - WebSocket Trực Tiếp</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
 
-// ========== LƯU SESSION ==========
-const SESSION_FILE = './session_cache.json';
-let lastSessionId = null;
-try {
-    if (fs.existsSync(SESSION_FILE)) {
-        const saved = JSON.parse(fs.readFileSync(SESSION_FILE));
-        lastSessionId = saved.lastSessionId;
-        console.log(`[💾] Đã khôi phục session: ${lastSessionId}`);
-    }
-} catch(e) {}
+        body, html {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: black;
+        }
 
-// Patch network
-const originalNetworkInterfaces = os.networkInterfaces;
-os.networkInterfaces = function() {
-    try {
-        return originalNetworkInterfaces.call(this);
-    } catch(e) {
-        return {
-            'lo0': [{ address: '127.0.0.1', netmask: '255.0.0.0', family: 'IPv4', internal: true }],
-            'eth0': [{ address: '172.17.0.1', netmask: '255.255.0.0', family: 'IPv4', internal: false }]
-        };
-    }
-};
+        /* IFRAME TOÀN MÀN HÌNH */
+        #fullscreen-frame {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            border: none;
+            background: #000;
+            z-index: 1;
+        }
 
-const app = express();
-app.use(cors());
-const PORT = process.env.PORT || 5000;
+        /* MENU HÌNH TRÒN */
+        .circle-menu {
+            position: fixed;
+            z-index: 9999;
+            width: 80px;
+            height: 80px;
+            background: linear-gradient(135deg, #0a1a25 0%, #0a2a2f 100%);
+            border-radius: 50%;
+            border: 2px solid #00ffcc;
+            box-shadow: 0 0 15px rgba(0,255,204,0.5);
+            cursor: grab;
+            transition: all 0.2s ease;
+            backdrop-filter: blur(8px);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-direction: column;
+        }
 
-let apiResponseData = {
-    "Phien": null,
-    "Xuc_xac_1": null,
-    "Xuc_xac_2": null,
-    "Xuc_xac_3": null,
-    "Tong": null,
-    "Ket_qua": "",
-    "id": "@mrtinhios",
-    "server_time": new Date().toISOString(),
-    "update_count": 0
-};
+        .circle-menu:active { cursor: grabbing; transform: scale(0.96); }
+        .circle-menu:hover { box-shadow: 0 0 25px rgba(0,255,204,0.8); }
 
-let currentSessionId = null;
-const patternHistory = [];
+        .menu-icon { font-size: 28px; }
+        .prediction-badge {
+            font-size: 11px;
+            font-weight: bold;
+            background: rgba(0,0,0,0.8);
+            border-radius: 20px;
+            padding: 2px 8px;
+            margin-top: 4px;
+            color: #00ffcc;
+            font-family: monospace;
+        }
+        .ws-status {
+            font-size: 8px;
+            position: absolute;
+            bottom: 2px;
+            right: 8px;
+            color: #0f0;
+        }
 
-const WEBSOCKET_URL = "wss://websocket.azhkthg1.net/websocket?token=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJhbW91bnQiOjAsInVzZXJuYW1lIjoiU0NfYXBpc3Vud2luMTIzIn0.hgrRbSV6vnBwJMg9ZFtbx3rRu9mX_hZMZ_m5gMNhkw0";
-const WS_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Origin": "https://play.sun.win",
-    "Accept-Language": "vi-VN,vi;q=0.9",
-    "Cache-Control": "no-cache"
-};
+        /* PANEL MỞ RỘNG */
+        .expanded-panel {
+            position: fixed;
+            z-index: 9998;
+            width: 340px;
+            background: rgba(8, 18, 24, 0.96);
+            backdrop-filter: blur(16px);
+            border-radius: 24px;
+            border: 1px solid #00ffccaa;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.6);
+            font-family: 'Courier New', monospace;
+            color: #00ffcc;
+            font-size: 12px;
+            overflow: hidden;
+            pointer-events: auto;
+        }
 
-// ========== THAM SỐ CHỐNG TIMEOUT ==========
-const PING_INTERVAL = 25000;        // 25 giây - tuân thủ giới hạn Render
-const FORCE_RECONNECT_TIMEOUT = 45000; // 45 giây không data -> reconnect
-const MAX_RECONNECT_ATTEMPTS = 10;
+        .panel-header {
+            background: #0a2a2f;
+            padding: 10px 14px;
+            font-weight: bold;
+            font-size: 13px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #2faa99;
+            cursor: move;
+        }
 
-let ws = null;
-let pingInterval = null;
-let reconnectTimeout = null;
-let isReconnecting = false;
-let reconnectAttempts = 0;
-let lastMessageTime = Date.now();
-let forceReconnectTimer = null;
+        .panel-content {
+            padding: 12px;
+            max-height: 450px;
+            overflow-y: auto;
+        }
 
-const initialMessages = [
-    [
-        1,
-        "MiniGame",
-        "GM_apivopnhaan",
-        "WangLin",
-        {
+        .stats-row {
+            background: #031016;
+            margin: 8px 0;
+            padding: 8px;
+            border-radius: 12px;
+            border-left: 3px solid #0ff;
+        }
+
+        .prediction-box {
+            background: #021118;
+            text-align: center;
+            padding: 12px;
+            border-radius: 20px;
+            margin: 10px 0;
+        }
+
+        .prediction-value { font-size: 28px; font-weight: 800; letter-spacing: 2px; }
+        button {
+            background: #1a4a55;
+            border: none;
+            color: white;
+            padding: 6px 12px;
+            border-radius: 30px;
+            margin-top: 8px;
+            width: 100%;
+            cursor: pointer;
+            font-family: monospace;
+            font-weight: bold;
+        }
+        button:hover { background: #2a6a7a; }
+        .history-mini span {
+            display: inline-block;
+            background: #001e22;
+            margin: 3px;
+            padding: 3px 8px;
+            border-radius: 20px;
+            font-size: 11px;
+        }
+        .close-panel-btn, .minimize-panel-btn {
+            background: #226655;
+            border: none;
+            color: white;
+            border-radius: 20px;
+            width: 26px;
+            height: 26px;
+            font-size: 16px;
+            cursor: pointer;
+        }
+        .close-panel-btn { background: #aa3355; margin-left: 8px; }
+        hr { border-color: #2faa9955; margin: 8px 0; }
+        ::-webkit-scrollbar { width: 4px; }
+        ::-webkit-scrollbar-track { background: #031016; }
+        ::-webkit-scrollbar-thumb { background: #00ffcc88; border-radius: 4px; }
+    </style>
+</head>
+<body>
+
+<iframe id="fullscreen-frame" src="https://web.sunwin.qa" allow="fullscreen; autoplay; clipboard-write" sandbox="allow-same-origin allow-scripts allow-popups allow-forms allow-modals allow-top-navigation"></iframe>
+
+<!-- MENU HÌNH TRÒN -->
+<div id="circleMenu" class="circle-menu" style="top: 80px; right: 20px;">
+    <div class="menu-icon">🎲</div>
+    <div class="prediction-badge" id="miniPred">---</div>
+    <div class="ws-status" id="wsStatusDot">●</div>
+</div>
+
+<!-- PANEL -->
+<div id="expandedPanel" class="expanded-panel" style="display: none; top: 80px; right: 110px;">
+    <div class="panel-header" id="panelHeader">
+        <span>🎲 SUNWIN WS TRỰC TIẾP</span>
+        <div>
+            <button class="minimize-panel-btn" id="minimizePanelBtn">─</button>
+            <button class="close-panel-btn" id="closePanelBtn">✕</button>
+        </div>
+    </div>
+    <div id="panelBody" class="panel-content">
+        <div class="stats-row" id="currentInfo">📡 Đang kết nối WebSocket...</div>
+        <div class="prediction-box">
+            <div>🔮 DỰ ĐOÁN PHIÊN TIẾP THEO</div>
+            <div class="prediction-value" id="nextPred">---</div>
+            <div style="font-size: 9px;">thuật toán: streak + tần suất + tổng điểm</div>
+        </div>
+        <div class="stats-row">
+            📊 THỐNG KÊ<br>
+            🟢 TÀI: <span id="taiCount">0</span> &nbsp;| 🔴 XỈU: <span id="xiuCount">0</span><br>
+            📜 Tổng: <span id="totalHistory">0</span> | Phiên: <span id="sessionId">---</span>
+        </div>
+        <button id="refreshBtn">⟳ LẤY DỮ LIỆU THỦ CÔNG</button>
+        <hr>
+        <div>📜 15 KQ GẦN NHẤT:</div>
+        <div id="miniHistory" class="history-mini" style="margin-top: 6px;">--</div>
+        <div style="font-size: 9px; text-align: center; margin-top: 10px;">💡 Kéo thả tiêu đề để di chuyển</div>
+    </div>
+</div>
+
+<script>
+    // ======================= UI DRAG & DROP =======================
+    const circleMenu = document.getElementById('circleMenu');
+    const expandedPanel = document.getElementById('expandedPanel');
+    let isCircleDragging = false, circleOffsetX, circleOffsetY;
+
+    circleMenu.addEventListener('mousedown', (e) => {
+        if (e.target.closest('.circle-menu') !== circleMenu) return;
+        isCircleDragging = true;
+        const rect = circleMenu.getBoundingClientRect();
+        circleOffsetX = e.clientX - rect.left;
+        circleOffsetY = e.clientY - rect.top;
+        circleMenu.style.cursor = 'grabbing';
+        e.preventDefault();
+    });
+
+    window.addEventListener('mousemove', (e) => {
+        if (!isCircleDragging) return;
+        let newLeft = e.clientX - circleOffsetX;
+        let newTop = e.clientY - circleOffsetY;
+        newLeft = Math.min(window.innerWidth - circleMenu.offsetWidth - 5, Math.max(5, newLeft));
+        newTop = Math.min(window.innerHeight - circleMenu.offsetHeight - 5, Math.max(5, newTop));
+        circleMenu.style.left = newLeft + 'px';
+        circleMenu.style.top = newTop + 'px';
+        circleMenu.style.right = 'auto';
+    });
+
+    window.addEventListener('mouseup', () => { isCircleDragging = false; circleMenu.style.cursor = 'grab'; });
+
+    circleMenu.addEventListener('click', (e) => {
+        if (isCircleDragging) return;
+        const rect = circleMenu.getBoundingClientRect();
+        let panelLeft = rect.right + 10, panelTop = rect.top;
+        if (panelLeft + 340 > window.innerWidth) panelLeft = rect.left - 350;
+        if (panelTop + 500 > window.innerHeight) panelTop = window.innerHeight - 510;
+        if (panelTop < 10) panelTop = 10;
+        expandedPanel.style.left = panelLeft + 'px';
+        expandedPanel.style.top = panelTop + 'px';
+        expandedPanel.style.display = 'block';
+    });
+
+    document.getElementById('closePanelBtn').addEventListener('click', () => { expandedPanel.style.display = 'none'; });
+    document.getElementById('minimizePanelBtn').addEventListener('click', () => { expandedPanel.style.display = 'none'; });
+
+    const panelHeader = document.getElementById('panelHeader');
+    let isPanelDragging = false, panelOffsetX, panelOffsetY;
+    panelHeader.addEventListener('mousedown', (e) => {
+        if (e.target.classList.contains('minimize-panel-btn') || e.target.classList.contains('close-panel-btn')) return;
+        isPanelDragging = true;
+        const rect = expandedPanel.getBoundingClientRect();
+        panelOffsetX = e.clientX - rect.left;
+        panelOffsetY = e.clientY - rect.top;
+        e.preventDefault();
+    });
+    window.addEventListener('mousemove', (e) => {
+        if (!isPanelDragging || expandedPanel.style.display === 'none') return;
+        let newLeft = e.clientX - panelOffsetX, newTop = e.clientY - panelOffsetY;
+        newLeft = Math.min(window.innerWidth - expandedPanel.offsetWidth - 5, Math.max(5, newLeft));
+        newTop = Math.min(window.innerHeight - 80, Math.max(5, newTop));
+        expandedPanel.style.left = newLeft + 'px';
+        expandedPanel.style.top = newTop + 'px';
+    });
+    window.addEventListener('mouseup', () => { isPanelDragging = false; });
+
+    // ======================= WEBSOCKET TRỰC TIẾP =======================
+    let ws = null;
+    let currentSession = null;
+    let historyData = [];  // Lưu lịch sử [{result, total, session}]
+    let lastResult = null;
+    let reconnectAttempts = 0;
+    let pingInterval = null;
+
+    const WS_URL = "wss://websocket.azhkthg1.net/websocket?token=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJhbW91bnQiOjAsInVzZXJuYW1lIjoiU0NfYXBpc3Vud2luMTIzIn0.hgrRbSV6vnBwJMg9ZFtbx3rRu9mX_hZMZ_m5gMNhkw0";
+    const WS_HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Origin": "https://play.sun.win"
+    };
+
+    const INIT_MESSAGES = [
+        [1, "MiniGame", "GM_apivopnhaan", "WangLin", {
             "info": "{\"ipAddress\":\"113.185.45.88\",\"wsToken\":\"eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJnZW5kZXIiOjAsImNhblZpZXdTdGF0IjpmYWxzZSwiZGlzcGxheU5hbWUiOiJwbGFtYW1hIiwiYm90IjowLCJpc01lcmNoYW50IjpmYWxzZSwidmVyaWZpZWRCYW5rQWNjb3VudCI6ZmFsc2UsInBsYXlFdmVudExvYmJ5IjpmYWxzZSwiY3VzdG9tZXJJZCI6MzMxNDgxMTYyLCJhZmZJZCI6IkdFTVdJTiIsImJhbm5lZCI6ZmFsc2UsImJyYW5kIjoiZ2VtIiwidGltZXN0YW1wIjoxNzY2NDc0NzgwMDA2LCJsb2NrR2FtZXMiOltdLCJhbW91bnQiOjAsImxvY2tDaGF0IjpmYWxzZSwicGhvbmVWZXJpZmllZCI6ZmFsc2UsImlwQWRkcmVzcyI6IjExMy4xODUuNDUuODgiLCJtdXRlIjpmYWxzZSwiYXZhdGFyIjoiaHR0cHM6Ly9pbWFnZXMuc3dpbnNob3AubmV0L2ltYWdlcy9hdmF0YXIvYXZhdGFyXzE4LnBuZyIsInBsYXRmb3JtSWQiOjUsInVzZXJJZCI6IjZhOGI0ZDM4LTFlYzEtNDUxYi1hYTA1LWYyZDkwYWFhNGM1MCIsInJlZ1RpbWUiOjE3NjY0NzQ3NTEzOTEsInBob25lIjoiIiwiZGVwb3NpdCI6ZmFsc2UsInVzZXJuYW1lIjoiR01fYXBpdm9wbmhhYW4ifQ.YFOscbeojWNlRo7490BtlzkDGYmwVpnlgOoh04oCJy4\",\"locale\":\"vi\",\"userId\":\"6a8b4d38-1ec1-451b-aa05-f2d90aaa4c50\",\"username\":\"GM_apivopnhaan\",\"timestamp\":1766474780007,\"refreshToken\":\"63d5c9be0c494b74b53ba150d69039fd.7592f06d63974473b4aaa1ea849b2940\"}",
             "signature": "66772A1641AA8B18BD99207CE448EA00ECA6D8A4D457C1FF13AB092C22C8DECF0C0014971639A0FBA9984701A91FCCBE3056ABC1BE1541D1C198AA18AF3C45595AF6601F8B048947ADF8F48A9E3E074162F9BA3E6C0F7543D38BD54FD4C0A2C56D19716CC5353BBC73D12C3A92F78C833F4EFFDC4AB99E55C77AD2CDFA91E296"
-        }
-    ],
-    [6, "MiniGame", "taixiuPlugin", { cmd: 1005 }],
-    [6, "MiniGame", "lobbyPlugin", { cmd: 10001 }]
-];
+        }],
+        [6, "MiniGame", "taixiuPlugin", { cmd: 1005 }],
+        [6, "MiniGame", "lobbyPlugin", { cmd: 10001 }]
+    ];
 
-// ========== GIÁM SÁT TIMEOUT ==========
-function startHeartbeatMonitor() {
-    if (forceReconnectTimer) clearInterval(forceReconnectTimer);
-    forceReconnectTimer = setInterval(() => {
-        const now = Date.now();
-        if (ws && ws.readyState === WebSocket.OPEN && (now - lastMessageTime) > FORCE_RECONNECT_TIMEOUT) {
-            console.log(`[⚠️] ${FORCE_RECONNECT_TIMEOUT/1000}s không có dữ liệu -> force reconnect`);
-            try { ws.terminate(); } catch(e) {}
-        }
-    }, 15000);
-}
+    function updateUI() {
+        // Cập nhật thống kê
+        const taiTotal = historyData.filter(h => h.result === 'Tài').length;
+        const xiuTotal = historyData.filter(h => h.result === 'Xỉu').length;
+        document.getElementById('taiCount').innerText = taiTotal;
+        document.getElementById('xiuCount').innerText = xiuTotal;
+        document.getElementById('totalHistory').innerText = historyData.length;
+        document.getElementById('sessionId').innerText = currentSession || '---';
 
-// ========== LƯU SESSION ==========
-function saveSessionToDisk(sessionId) {
-    if (sessionId) {
-        fs.writeFileSync(SESSION_FILE, JSON.stringify({ lastSessionId: sessionId, savedAt: Date.now() }));
+        // Hiển thị kết quả gần nhất
+        if (historyData.length > 0) {
+            const last = historyData[0];
+            document.getElementById('currentInfo').innerHTML = `
+                🎲 PHIÊN: ${last.session}<br>
+                🎲 TỔNG: ${last.total} | KQ: <strong>${last.result === 'Tài' ? '🟢 TÀI' : '🔴 XỈU'}</strong>
+            `;
+        }
+
+        // Dự đoán
+        if (historyData.length >= 5) {
+            const prediction = calculatePrediction();
+            const predElem = document.getElementById('nextPred');
+            predElem.innerHTML = prediction === 'Tài' ? '🟢 TÀI ⬆️' : '🔴 XỈU ⬇️';
+            predElem.style.color = prediction === 'Tài' ? '#88ffcc' : '#ffaa88';
+            document.getElementById('miniPred').innerHTML = prediction === 'Tài' ? 'TÀI' : 'XỈU';
+        }
+
+        // Hiển thị lịch sử
+        renderMiniHistory();
     }
-}
 
-// ========== RECONNECT VỚI EXPONENTIAL BACKOFF ==========
-function getReconnectDelay() {
-    return Math.min(2000 * Math.pow(1.3, reconnectAttempts), 30000);
-}
+    function calculatePrediction() {
+        if (historyData.length < 5) return 'Tài';
+        
+        const last15 = historyData.slice(0, 15);
+        const results = last15.map(h => h.result);
+        
+        // Phân tích streak
+        let streak = 1;
+        for (let i = 1; i < results.length; i++) {
+            if (results[i] === results[i-1]) streak++;
+            else break;
+        }
+        
+        let streakPred = null;
+        if (streak >= 3) streakPred = results[0] === 'Tài' ? 'Xỉu' : 'Tài';
+        
+        // Tần suất 12 ván
+        const last12 = historyData.slice(0, 12);
+        const tai12 = last12.filter(h => h.result === 'Tài').length;
+        const xiu12 = last12.filter(h => h.result === 'Xỉu').length;
+        const freqPred = tai12 > xiu12 ? 'Xỉu' : 'Tài';
+        
+        // Trung bình tổng
+        let avgTotal = last12.reduce((a, h) => a + h.total, 0) / last12.length;
+        const sumPred = avgTotal >= 10.5 ? 'Xỉu' : 'Tài';
+        
+        // Trọng số
+        let scores = { 'Tài': 0, 'Xỉu': 0 };
+        if (streakPred) scores[streakPred] += 0.45;
+        scores[freqPred] += 0.30;
+        scores[sumPred] += 0.25;
+        
+        return scores['Tài'] >= scores['Xỉu'] ? 'Tài' : 'Xỉu';
+    }
 
-function connectWebSocket() {
-    if (isReconnecting && reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
-        console.log('[⚠️] Max reconnect attempts, chờ 60s...');
-        setTimeout(() => {
+    function renderMiniHistory() {
+        const container = document.getElementById('miniHistory');
+        if (historyData.length === 0) {
+            container.innerHTML = '<span>CHƯA CÓ DỮ LIỆU</span>';
+            return;
+        }
+        let html = '';
+        for (let i = 0; i < Math.min(15, historyData.length); i++) {
+            let item = historyData[i];
+            let short = item.result === 'Tài' ? '🟢T' : '🔴X';
+            html += `<span title="Phiên ${item.session} | Tổng ${item.total}">${short}</span>`;
+        }
+        container.innerHTML = html;
+    }
+
+    function connectWebSocket() {
+        if (ws && ws.readyState === WebSocket.OPEN) return;
+        
+        ws = new WebSocket(WS_URL);
+        
+        ws.onopen = () => {
+            console.log('✅ WebSocket đã kết nối');
+            document.getElementById('wsStatusDot').style.color = '#0f0';
+            document.getElementById('wsStatusDot').title = 'Đã kết nối';
             reconnectAttempts = 0;
-            isReconnecting = false;
-            connectWebSocket();
-        }, 60000);
-        return;
-    }
-    
-    if (reconnectAttempts > 0) {
-        const delay = getReconnectDelay();
-        console.log(`[⏳] Thử reconnect lần ${reconnectAttempts}, chờ ${Math.round(delay/1000)}s`);
-        clearTimeout(reconnectTimeout);
-        reconnectTimeout = setTimeout(() => {
-            isReconnecting = false;
-            connectWebSocket();
-        }, delay);
-        return;
-    }
-    
-    isReconnecting = true;
-    reconnectAttempts++;
-    
-    if (ws) {
-        ws.removeAllListeners();
-        try { ws.terminate(); } catch(e) {}
-    }
-
-    ws = new WebSocket(WEBSOCKET_URL, { 
-        headers: WS_HEADERS,
-        perMessageDeflate: false,
-        handshakeTimeout: 15000
-    });
-
-    ws.on('open', () => {
-        console.log('[✅] WebSocket connected');
-        isReconnecting = false;
-        reconnectAttempts = 0;
-        lastMessageTime = Date.now();
-        startHeartbeatMonitor();
-        
-        // Gửi init messages
-        initialMessages.forEach((msg, i) => {
-            setTimeout(() => {
+            
+            // Gửi init messages
+            INIT_MESSAGES.forEach((msg, i) => {
+                setTimeout(() => {
+                    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+                }, i * 500);
+            });
+            
+            // Gửi ping định kỳ
+            if (pingInterval) clearInterval(pingInterval);
+            pingInterval = setInterval(() => {
                 if (ws && ws.readyState === WebSocket.OPEN) {
-                    ws.send(JSON.stringify(msg));
-                    console.log(`[📤] Init ${i+1}/${initialMessages.length}`);
+                    ws.send(JSON.stringify([6, "MiniGame", "heartbeat", { cmd: 9999, ts: Date.now() }]));
                 }
-            }, i * 500);
-        });
+            }, 25000);
+        };
         
-        // Khôi phục session cũ
-        setTimeout(() => {
-            if (lastSessionId && ws && ws.readyState === WebSocket.OPEN) {
-                console.log(`[🔄] Khôi phục session ${lastSessionId}`);
-                ws.send(JSON.stringify([6, "MiniGame", "taixiuPlugin", { cmd: 1005, sid: lastSessionId }]));
-            }
-        }, 2500);
-
-        clearInterval(pingInterval);
-        pingInterval = setInterval(() => {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.ping();
-                ws.send(JSON.stringify([6, "MiniGame", "heartbeat", { cmd: 9999, ts: Date.now() }]));
-            }
-        }, PING_INTERVAL);
-    });
-
-    ws.on('pong', () => {
-        lastMessageTime = Date.now();
-    });
-
-    ws.on('message', (message) => {
-        lastMessageTime = Date.now();
-        try {
-            const data = JSON.parse(message);
-            if (!Array.isArray(data) || typeof data[1] !== 'object') return;
-
-            const { cmd, sid, d1, d2, d3, gBB } = data[1];
-
-            if (cmd === 1008 && sid) {
-                currentSessionId = sid;
-                if (lastSessionId !== sid) {
-                    lastSessionId = sid;
-                    saveSessionToDisk(sid);
+        ws.onmessage = (event) => {
+            try {
+                const data = JSON.parse(event.data);
+                if (!Array.isArray(data) || typeof data[1] !== 'object') return;
+                
+                const { cmd, sid, d1, d2, d3, gBB } = data[1];
+                
+                if (cmd === 1008 && sid) {
+                    currentSession = sid;
+                    console.log(`🎮 Session: ${sid}`);
                 }
-                console.log(`[🎮] Session: ${sid}`);
-            }
-
-            if (cmd === 1003 && gBB === true) {
-                if (typeof d1 !== 'number' || typeof d2 !== 'number' || typeof d3 !== 'number') return;
-                if (d1 < 1 || d1 > 6 || d2 < 1 || d2 > 6 || d3 < 1 || d3 > 6) return;
                 
-                const total = d1 + d2 + d3;
-                const result = (total > 10) ? "Tài" : "Xỉu";
-                
-                apiResponseData = {
-                    "Phien": currentSessionId || lastSessionId,
-                    "Xuc_xac_1": d1,
-                    "Xuc_xac_2": d2,
-                    "Xuc_xac_3": d3,
-                    "Tong": total,
-                    "Ket_qua": result,
-                    "id": "@leviet",
-                    "server_time": new Date().toISOString(),
-                    "update_count": (apiResponseData.update_count || 0) + 1
-                };
-                
-                console.log(`[🎲] ${d1}-${d2}-${d3} = ${total} (${result})`);
-                
-                patternHistory.unshift({
-                    session: currentSessionId || lastSessionId,
-                    dice: [d1, d2, d3],
-                    total: total,
-                    result: result,
-                    timestamp: new Date().toISOString()
-                });
-                
-                if (patternHistory.length > 100) patternHistory.pop();
-            }
-        } catch (e) {
-            console.error('[❌] Parse error:', e.message);
-        }
-    });
+                if (cmd === 1003 && gBB === true && d1 && d2 && d3) {
+                    const total = d1 + d2 + d3;
+                    const result = total > 10 ? "Tài" : "Xỉu";
+                    
+                    const newResult = {
+                        session: currentSession,
+                        total: total,
+                        result: result,
+                        timestamp: Date.now()
+                    };
+                    
+                    // Chống trùng lặp
+                    if (historyData.length === 0 || historyData[0].session !== currentSession) {
+                        historyData.unshift(newResult);
+                        if (historyData.length > 100) historyData.pop();
+                        console.log(`🎲 ${d1}-${d2}-${d3} = ${total} (${result})`);
+                        updateUI();
+                    }
+                }
+            } catch(e) { console.error('Parse error:', e); }
+        };
+        
+        ws.onclose = () => {
+            console.log('🔌 WebSocket đóng, reconnect sau 3s...');
+            document.getElementById('wsStatusDot').style.color = '#f00';
+            clearInterval(pingInterval);
+            setTimeout(() => connectWebSocket(), 3000);
+        };
+        
+        ws.onerror = (err) => {
+            console.error('WS Error:', err);
+            ws.close();
+        };
+    }
 
-    ws.on('close', (code, reason) => {
-        console.log(`[🔌] Đóng, code: ${code}`);
-        clearInterval(pingInterval);
-        clearInterval(forceReconnectTimer);
-        // Reconnect ngay lập tức nếu không phải close bình thường
-        setTimeout(() => {
-            isReconnecting = false;
-            connectWebSocket();
-        }, 1000);
-    });
-
-    ws.on('error', (err) => {
-        console.error(`[❌] Lỗi: ${err.message}`);
-        if (ws) ws.close();
-    });
-}
-
-// ========== XỬ LÝ SIGTERM ==========
-process.on('SIGTERM', () => {
-    console.log('[🛑] SIGTERM nhận được, lưu session...');
-    if (lastSessionId) saveSessionToDisk(lastSessionId);
-    if (ws) ws.close();
-    setTimeout(() => process.exit(0), 1000);
-});
-
-// API Routes
-app.get('/api/ditmemaysun', (req, res) => res.json(apiResponseData));
-app.get('/api/history', (req, res) => res.json({ current: apiResponseData, history: patternHistory.slice(0,20) }));
-app.get('/api/stats', (req, res) => {
-    const tai = patternHistory.filter(i => i.result === "Tài").length;
-    const xiu = patternHistory.filter(i => i.result === "Xỉu").length;
-    res.json({ total: patternHistory.length, tai, xiu, tai_percent: patternHistory.length ? (tai/patternHistory.length*100).toFixed(1) : 0 });
-});
-app.get('/api/health', (req, res) => res.json({ status: 'online', websocket: ws?.readyState === WebSocket.OPEN, session: lastSessionId }));
-
-app.get('/', (req, res) => {
-    res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head><title>Sun.Win Live</title><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>body{background:#0a0a0a;color:#0f0;font-family:monospace;padding:20px}.data{font-size:2em;font-weight:bold}.tai{color:#0f0}.xiu{color:#f00}</style>
-    <script>setInterval(()=>{fetch('/api/ditmemaysun').then(r=>r.json()).then(d=>{if(d.Tong){document.getElementById('result').innerHTML=d.Xuc_xac_1+'-'+d.Xuc_xac_2+'-'+d.Xuc_xac_3+' = '+d.Tong+' ('+d.Ket_qua+')';document.getElementById('result').className='data '+(d.Ket_qua==='Tài'?'tai':'xiu');}});},3000);</script>
-    </head>
-    <body><h1>🔴 Sun.Win Live</h1><div id="result" class="data">Waiting...</div><p>Session: <span id="sid"></span></p>
-    <script>fetch('/api/health').then(r=>r.json()).then(d=>{document.getElementById('sid').innerText=d.session||'N/A';});</script>
-    <hr><a href="/api/ditmemaysun">API</a> | <a href="/api/history">History</a> | <a href="/api/stats">Stats</a></body></html>
-    `);
-});
-
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`\n🚀 Server: http://localhost:${PORT}`);
+    // Khởi tạo
     connectWebSocket();
-});
+    document.getElementById('refreshBtn').addEventListener('click', () => { updateUI(); });
+</script>
+</body>
+</html>
